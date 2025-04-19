@@ -1,12 +1,12 @@
-# Dashcam Video Consolidation Tool
+# BlackVue Footage Consolidation Tool
 
-A tool for consolidating dashcam footage into continuous video segments, automatically handling front and rear camera footage separately.
+A tool for consolidating dashcam footage into continuous video segments, and automatically handling trimming overlaps for front and rear camera footage separately.
 
 ## Features
 
 - Automatically identifies front and rear camera footage from dashcam files
 - Combines video files into continuous segments
-- Intelligently trims overlapping footage to prevent duplication
+- Trims overlapping footage to prevent duplication
 - Creates separate videos for non-continuous time periods
 - Organizes output files with clear time-based naming convention
 - Supports multiple dashcam file naming formats
@@ -49,7 +49,7 @@ Options:
 - `--max-gap SECONDS`: Maximum time gap in seconds between clips to consider them continuous (default: 30.0)
 - `--no-gpu`: Disable GPU acceleration for video processing
 - `--cpu-threads THREADS`: Number of CPU threads to use for encoding (0=auto)
-- `--camera {front,rear}`: Process only the specified camera type
+- `--camera {front,rear}`: Process only the specified camera type if you have footage from a dual camera system
 
 ## Progress Tracking
 
