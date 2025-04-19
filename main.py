@@ -465,7 +465,7 @@ def merge_videos_with_trim(video_files, output_file, input_dir, use_gpu=True, cp
         print(f"  Error executing ffmpeg: {str(e)}")
         return False
 
-def process_dashcam_videos(input_dir, output_dir, max_gap=30.0, use_gpu=True, cpu_threads=0, camera_type=None):
+def process_dashcam_videos(input_dir, output_dir, max_gap=30.0, use_gpu=True, cpu_threads=0, camera_type=None, summary_only=False):
     """
     Process dashcam videos from the input directory.
     
@@ -476,8 +476,9 @@ def process_dashcam_videos(input_dir, output_dir, max_gap=30.0, use_gpu=True, cp
         use_gpu: Whether to attempt to use GPU acceleration
         cpu_threads: Number of CPU threads to use (0=auto)
         camera_type: Optional filter to only process specific camera type (front, rear)
+        summary_only: If True, only show summary information without processing files
     """
-    if not os.path.exists(output_dir):
+    if not summary_only and not os.path.exists(output_dir):
         os.makedirs(output_dir)
     
     # Get all MP4 files
@@ -521,15 +522,91 @@ def process_dashcam_videos(input_dir, output_dir, max_gap=30.0, use_gpu=True, cp
     else:
         process_cameras = list(videos_by_camera.keys())
     
+    # For each camera type, analyze continuity
+    for cam_type in process_cameras:
+        videos = videos_by_camera[cam_type]
+        print(f"\nAnalyzing {cam_type} camera videos...")
+        
+        # Group videos by continuity
+        print("  Analyzing time continuity...")
+        video_groups = group_videos_by_continuity(videos, max_gap, input_dir)
+        print(f"  Found {len(video_groups)} continuous segments")
+        
+        # Print summary of each group
+        total_duration = 0
+        for i, group in enumerate(video_groups):
+            # Sort videos in each group by timestamp
+            sorted_group = sorted(group, key=lambda x: x["timestamp"])
+            
+            # Calculate group duration
+            start_time = sorted_group[0]["timestamp"]
+            end_time = sorted_group[-1]["timestamp"]
+            
+            # Try to get actual duration by adding up video durations with overlaps removed
+            group_duration = 0
+            for j, video in enumerate(sorted_group):
+                video_path = os.path.join(input_dir, video["filename"])
+                duration = get_video_duration(video_path)
+                
+                if duration is None:
+                    continue
+                
+                # For first video, include full duration
+                if j == 0:
+                    group_duration += duration
+                    continue
+                
+                # For subsequent videos, calculate overlap with previous
+                prev_video = sorted_group[j-1]
+                prev_path = os.path.join(input_dir, prev_video["filename"])
+                prev_duration = get_video_duration(prev_path)
+                
+                if prev_duration is None:
+                    group_duration += duration
+                    continue
+                
+                # Calculate overlap
+                prev_end_time = prev_video["timestamp"] + datetime.timedelta(seconds=prev_duration)
+                current_start_time = video["timestamp"]
+                overlap_seconds = max(0, (prev_end_time - current_start_time).total_seconds())
+                
+                # Add non-overlapping portion to duration
+                non_overlap_duration = max(0, duration - overlap_seconds)
+                group_duration += non_overlap_duration
+            
+            total_duration += group_duration
+            
+            # Format group info
+            start_str = start_time.strftime("%Y-%m-%d %H:%M:%S")
+            end_str = end_time.strftime("%Y-%m-%d %H:%M:%S")
+            duration_str = f"{int(group_duration // 60)}:{int(group_duration % 60):02d}"
+            
+            print(f"  Group {i+1}: {len(sorted_group)} videos, {start_str} to {end_str}, Duration: {duration_str}")
+        
+        # Print total duration
+        hours = int(total_duration // 3600)
+        minutes = int((total_duration % 3600) // 60)
+        seconds = int(total_duration % 60)
+        
+        if hours > 0:
+            duration_str = f"{hours}h {minutes}m {seconds}s"
+        else:
+            duration_str = f"{minutes}m {seconds}s"
+        
+        print(f"  Total {cam_type} camera footage: {duration_str}")
+    
+    # If summary only, exit here
+    if summary_only:
+        print("\nSummary complete. No files were processed.")
+        return
+    
     # Process each camera type
     for cam_type in process_cameras:
         videos = videos_by_camera[cam_type]
         print(f"\nProcessing {cam_type} camera videos...")
         
         # Group videos by continuity
-        print("  Analyzing time continuity...")
         video_groups = group_videos_by_continuity(videos, max_gap, input_dir)
-        print(f"  Found {len(video_groups)} continuous segments")
         
         for i, group in enumerate(video_groups):
             # Sort videos in each group by timestamp
@@ -561,12 +638,13 @@ def process_dashcam_videos(input_dir, output_dir, max_gap=30.0, use_gpu=True, cp
             else:
                 print(f"  Failed to merge videos to {output_file}")
     
-    print("\nDashcam video consolidation complete!")
+    if not summary_only:
+        print("\nDashcam video consolidation complete!")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Dashcam Video Consolidation Tool")
     parser.add_argument("input_dir", help="Directory containing dashcam footage")
-    parser.add_argument("output_dir", help="Directory to save consolidated videos")
+    parser.add_argument("output_dir", nargs="?", help="Directory to save consolidated videos")
     parser.add_argument("--max-gap", type=float, default=30.0,
                        help="Maximum gap in seconds between videos to consider them continuous (default: 30.0)")
     parser.add_argument("--no-gpu", action="store_true",
@@ -575,15 +653,25 @@ if __name__ == "__main__":
                        help="Number of CPU threads to use for encoding (0=auto)")
     parser.add_argument("--camera", choices=["front", "rear"], 
                        help="Process only specified camera type (front or rear)")
+    parser.add_argument("--summary-only", action="store_true",
+                       help="Only show a summary of videos, don't process them")
     
     args = parser.parse_args()
+    
+    # Check if output_dir is required
+    if not args.summary_only and not args.output_dir:
+        parser.error("output_dir is required unless --summary-only is specified")
+    
+    # Use input_dir as output_dir for summary-only mode if not specified
+    output_dir = args.output_dir if args.output_dir else args.input_dir
     
     # Process videos
     process_dashcam_videos(
         args.input_dir,
-        args.output_dir,
+        output_dir,
         args.max_gap,
         not args.no_gpu,
         args.cpu_threads,
-        args.camera
+        args.camera,
+        args.summary_only
     )
