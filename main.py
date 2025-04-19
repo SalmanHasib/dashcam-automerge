@@ -112,7 +112,7 @@ def get_video_duration(filepath):
         print(f"Error parsing duration data for {filepath}")
         return None
 
-def group_videos_by_continuity(videos, max_gap=120.0, input_dir=None):
+def group_videos_by_continuity(videos, max_gap=30.0, input_dir=None):
     """
     Group videos into continuous sequences.
     max_gap: maximum allowed gap in seconds between videos to consider them continuous
@@ -291,7 +291,7 @@ def merge_videos_with_trim(video_files, output_file, input_dir, use_gpu=True, cp
     try:
         probe_result = subprocess.run(probe_cmd, capture_output=True, text=True)
         codec_info = json.loads(probe_result.stdout)
-        video_codec = codec_info['streams'][0].get('codec_name', 'h264')
+        video_codec = codec_info['streams'][0].get('codec_name', 'h264_nvenc')
         
         # Try to get bitrate, default to high quality if not available
         try:
@@ -302,8 +302,14 @@ def merge_videos_with_trim(video_files, output_file, input_dir, use_gpu=True, cp
         print(f"  Source video codec: {video_codec}, bitrate: {bitrate/1000000:.2f} Mbps")
     except Exception as e:
         print(f"  Error getting codec info: {str(e)}")
-        video_codec = 'h264'
+        video_codec = 'h264_nvenc'
         bitrate = 8000000
+    
+    # Calculate total duration for progress reporting
+    total_duration = 0
+    for info in trim_info:
+        total_duration += info['duration']
+    print(f"  Total video duration: {total_duration:.2f} seconds")
     
     # Build the trim and concat filter complex
     for i, info in enumerate(trim_info):
@@ -314,11 +320,11 @@ def merge_videos_with_trim(video_files, output_file, input_dir, use_gpu=True, cp
         # Add to concat list
         concat_parts.append(f"[v{i}][a{i}]")
     
-    # Add concat filter
+    # Add concat filter with safe option for different bitrates
     filter_complex += f"{''.join(concat_parts)}concat=n={len(trim_info)}:v=1:a=1[outv][outa]"
     
     # Build ffmpeg command
-    cmd = ["ffmpeg"]
+    cmd = ["ffmpeg", "-hide_banner", "-y"]
     
     # Add inputs
     for info in trim_info:
@@ -330,6 +336,9 @@ def merge_videos_with_trim(video_files, output_file, input_dir, use_gpu=True, cp
     # Add mapping
     cmd.extend(["-map", "[outv]", "-map", "[outa]"])
     
+    # Add progress monitoring
+    cmd.extend(["-progress", "pipe:1", "-stats"])
+    
     # Set thread count if specified
     if cpu_threads > 0:
         cmd.extend(["-threads", str(cpu_threads)])
@@ -339,11 +348,13 @@ def merge_videos_with_trim(video_files, output_file, input_dir, use_gpu=True, cp
         if "nvenc" in gpu_codec:
             # NVIDIA GPU settings with high quality preset
             cmd.extend([
+                "-pix_fmt", "yuv420p",
                 "-c:v", gpu_codec,
                 "-preset", "p7",     # p7 is equivalent to "slow" - high quality
                 "-tune", "hq",       # High quality tuning
                 "-rc:v", "vbr",      # Variable bitrate mode
-                "-cq:v", "19",       # Lower value means better quality
+                "-cq:v", "18",       # Lower value means better quality
+                "-c:a", "aac",
                 "-b:v", str(bitrate), 
                 "-maxrate:v", str(int(bitrate * 1.5)),
                 "-bufsize:v", str(int(bitrate * 2))
@@ -400,19 +411,72 @@ def merge_videos_with_trim(video_files, output_file, input_dir, use_gpu=True, cp
     cmd_str = " ".join(cmd)
     print(f"  FFmpeg command: {cmd_str[:100]}...")
     
-    # Execute command
+    # Execute command with progress tracking
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True)
-        if result.returncode != 0:
-            print(f"  Error merging videos: {result.stderr}")
+        process = subprocess.Popen(
+            cmd, 
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            universal_newlines=True,
+            bufsize=1
+        )
+        
+        # Variables to track progress
+        progress = 0
+        
+        print("  Processing: [" + " " * 50 + "] 0%", end="\r", flush=True)
+        
+        # Monitor process output for progress updates
+        for line in process.stdout:
+            line = line.strip()
+            
+            # Look for progress information
+            if line.startswith("out_time_ms="):
+                try:
+                    # Convert microseconds to seconds
+                    time_ms = int(line.split("=")[1])
+                    current_time = time_ms / 1000000
+                    
+                    # Calculate progress percentage
+                    if total_duration > 0:
+                        new_progress = min(int((current_time / total_duration) * 100), 100)
+                        
+                        # Only update if progress has changed
+                        if new_progress != progress:
+                            progress = new_progress
+                            bar_length = int(progress / 2)
+                            progress_bar = "[" + "#" * bar_length + " " * (50 - bar_length) + "]"
+                            print(f"  Processing: {progress_bar} {progress}%", end="\r", flush=True)
+                except (ValueError, ZeroDivisionError):
+                    pass
+        
+        # Wait for process to complete
+        process.wait()
+        
+        # Ensure we show 100% at the end
+        print("  Processing: [" + "#" * 50 + "] 100%")
+        
+        if process.returncode != 0:
+            stderr_output = process.stderr.read()
+            print(f"  Error merging videos: {stderr_output}")
             return False
         return True
     except Exception as e:
         print(f"  Error executing ffmpeg: {str(e)}")
         return False
 
-def process_dashcam_videos(input_dir, output_dir, max_gap=120.0, use_gpu=True, cpu_threads=0):
-    """Process dashcam videos from the input directory."""
+def process_dashcam_videos(input_dir, output_dir, max_gap=30.0, use_gpu=True, cpu_threads=0, camera_type=None):
+    """
+    Process dashcam videos from the input directory.
+    
+    Args:
+        input_dir: Directory containing dashcam footage
+        output_dir: Directory to save consolidated videos
+        max_gap: Maximum gap in seconds between videos to consider them continuous
+        use_gpu: Whether to attempt to use GPU acceleration
+        cpu_threads: Number of CPU threads to use (0=auto)
+        camera_type: Optional filter to only process specific camera type (front, rear)
+    """
     if not os.path.exists(output_dir):
         os.makedirs(output_dir)
     
@@ -445,12 +509,22 @@ def process_dashcam_videos(input_dir, output_dir, max_gap=120.0, use_gpu=True, c
     
     # Print summary of found videos
     print("\nFound videos by camera type:")
-    for camera_type, videos in videos_by_camera.items():
-        print(f"  {camera_type}: {len(videos)} videos")
+    for cam_type, videos in videos_by_camera.items():
+        print(f"  {cam_type}: {len(videos)} videos")
+    
+    # Filter by camera type if specified
+    if camera_type:
+        if camera_type not in videos_by_camera:
+            print(f"No videos found for camera type: {camera_type}")
+            return
+        process_cameras = [camera_type]
+    else:
+        process_cameras = list(videos_by_camera.keys())
     
     # Process each camera type
-    for camera_type, videos in videos_by_camera.items():
-        print(f"\nProcessing {camera_type} camera videos...")
+    for cam_type in process_cameras:
+        videos = videos_by_camera[cam_type]
+        print(f"\nProcessing {cam_type} camera videos...")
         
         # Group videos by continuity
         print("  Analyzing time continuity...")
@@ -473,7 +547,7 @@ def process_dashcam_videos(input_dir, output_dir, max_gap=120.0, use_gpu=True, c
             
             output_file = os.path.join(
                 output_dir, 
-                f"{camera_type}_{start_str}_to_{end_str}.mp4"
+                f"{cam_type}_{start_str}_to_{end_str}.mp4"
             )
             
             print(f"  Merging group {i+1}/{len(video_groups)} with {len(video_files)} videos")
@@ -493,13 +567,23 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Dashcam Video Consolidation Tool")
     parser.add_argument("input_dir", help="Directory containing dashcam footage")
     parser.add_argument("output_dir", help="Directory to save consolidated videos")
-    parser.add_argument("--max-gap", type=float, default=120.0,
-                       help="Maximum gap in seconds between videos to consider them continuous (default: 120.0)")
+    parser.add_argument("--max-gap", type=float, default=30.0,
+                       help="Maximum gap in seconds between videos to consider them continuous (default: 30.0)")
     parser.add_argument("--no-gpu", action="store_true",
                        help="Disable GPU acceleration for video processing")
     parser.add_argument("--cpu-threads", type=int, default=0,
                        help="Number of CPU threads to use for encoding (0=auto)")
+    parser.add_argument("--camera", choices=["front", "rear"], 
+                       help="Process only specified camera type (front or rear)")
     
     args = parser.parse_args()
     
-    process_dashcam_videos(args.input_dir, args.output_dir, args.max_gap, not args.no_gpu, args.cpu_threads)
+    # Process videos
+    process_dashcam_videos(
+        args.input_dir,
+        args.output_dir,
+        args.max_gap,
+        not args.no_gpu,
+        args.cpu_threads,
+        args.camera
+    )

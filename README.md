@@ -1,4 +1,4 @@
-# BlackVue Dashcam Video Consolidation Tool
+# Dashcam Video Consolidation Tool
 
 A tool for consolidating dashcam footage into continuous video segments, automatically handling front and rear camera footage separately.
 
@@ -7,11 +7,12 @@ A tool for consolidating dashcam footage into continuous video segments, automat
 - Automatically identifies front and rear camera footage from dashcam files
 - Combines video files into continuous segments
 - Intelligently trims overlapping footage to prevent duplication
-- Creates separate video files for non-continuous time periods
+- Creates separate videos for non-continuous time periods
 - Organizes output files with clear time-based naming convention
 - Supports multiple dashcam file naming formats
 - GPU acceleration support for faster processing (NVIDIA, Intel QSV, VAAPI, VideoToolbox)
 - Quality preservation to match source video
+- Real-time progress tracking during video processing
 
 ## Requirements
 
@@ -45,9 +46,20 @@ Arguments:
 - `output_directory`: Directory where consolidated videos will be saved
 
 Options:
-- `--max-gap SECONDS`: Maximum time gap in seconds between clips to consider them continuous (default: 120.0)
+- `--max-gap SECONDS`: Maximum time gap in seconds between clips to consider them continuous (default: 30.0)
 - `--no-gpu`: Disable GPU acceleration for video processing
 - `--cpu-threads THREADS`: Number of CPU threads to use for encoding (0=auto)
+- `--camera {front,rear}`: Process only the specified camera type
+
+## Progress Tracking
+
+The tool displays a real-time progress bar during the FFmpeg processing:
+
+```
+Processing: [##############################                    ] 60%
+```
+
+This helps you monitor the conversion process, especially for large files.
 
 ## GPU Acceleration
 
@@ -74,40 +86,22 @@ The tool analyzes your source video files and attempts to match their quality se
 
 This ensures your combined videos maintain similar quality to the original footage.
 
-## Example
+## Examples
 
+Basic consolidation:
 ```
-python main.py ~/Downloads/BlackVue_Footage ~/Videos/Dashcam_Consolidated
-```
-
-## Testing with Generated Files
-
-The repository includes a script (`create_test_files.py`) that can generate test files to help you test the consolidation tool without real dashcam footage:
-
-```
-python create_test_files.py test_files --front 10 --rear 10
+python main.py ~/Dashcam/Videos ~/Consolidated
 ```
 
-This will create a directory called `test_files` with 10 front camera videos and 10 rear camera videos. By default, a time gap is inserted in the middle of the footage to test the continuity detection. Use the `--no-gap` flag to create continuous footage.
-
-After generating the test files, you can run the consolidation tool on them:
-
+Process only front camera footage:
 ```
-python main.py test_files output_files
+python main.py ~/Dashcam/Videos ~/Consolidated --camera front
 ```
 
-## Output Format
-
-The tool will create consolidated videos in the output directory with the following naming convention:
-
+Process with a larger time gap tolerance:
 ```
-<camera_type>_<start_timestamp>_to_<end_timestamp>.mp4
+python main.py ~/Dashcam/Videos ~/Consolidated --max-gap 60
 ```
-
-Where:
-- `camera_type` is either "front" or "rear"
-- `start_timestamp` is the timestamp of the first video in the sequence
-- `end_timestamp` is the timestamp of the last video in the sequence
 
 ## Supported Dashcam Formats
 
@@ -149,7 +143,6 @@ The tool also supports other dashcam formats as long as:
 Examples:
 - `DashCam_Front_20230615_172045.mp4`
 - `RoadCam_20230615_172045_rear.mp4`
-- `Car_F_20230615_172045.mp4`
 
 ## How Overlap Handling Works
 
