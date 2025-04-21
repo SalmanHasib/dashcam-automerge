@@ -8,6 +8,7 @@ import datetime
 import json
 import sys
 from collections import defaultdict
+import shutil
 
 def parse_filename(filename):
     """
@@ -223,6 +224,8 @@ def merge_videos_with_trim(video_files, output_file, input_dir, use_gpu=True, cp
     """
     Merge video files using ffmpeg, trimming overlapping parts.
     Leverages GPU acceleration if available and preserves input quality.
+    Uses a hierarchical batch approach to reduce memory usage by processing 
+    in batches of 10 files at a time.
     
     Args:
         video_files: List of video file paths to merge
@@ -237,38 +240,49 @@ def merge_videos_with_trim(video_files, output_file, input_dir, use_gpu=True, cp
         print(f"  No valid videos to merge after analyzing overlaps")
         return False
     
-    # Create filter complex for trimming and concatenating
-    filter_complex = ""
-    concat_parts = []
-    
     # Determine if we can use GPU acceleration
     gpu_available = False
     gpu_codec = None
+    hw_device = None
     
     if use_gpu:
         # Check for available hardware acceleration methods
         try:
+            # Try to detect GPU capabilities
             gpu_check = subprocess.run(
                 ["ffmpeg", "-hide_banner", "-hwaccels"],
                 capture_output=True, text=True, check=False
             )
-            
-            # Check for different hardware acceleration methods
             hw_accels = gpu_check.stdout.lower()
             
-            if "cuda" in hw_accels:
+            # Check available encoders
+            encoders_check = subprocess.run(
+                ["ffmpeg", "-hide_banner", "-encoders"],
+                capture_output=True, text=True, check=False
+            )
+            encoders = encoders_check.stdout.lower()
+            
+            print("  Detected hardware acceleration methods:", hw_accels.strip())
+            
+            # NVIDIA GPU
+            if "cuda" in hw_accels and "h264_nvenc" in encoders:
                 gpu_available = True
                 gpu_codec = "h264_nvenc"
                 print("  NVIDIA GPU acceleration available (NVENC)")
-            elif "qsv" in hw_accels and os.name == 'nt':  # Windows-specific
+            # Intel QuickSync
+            elif "qsv" in hw_accels and "h264_qsv" in encoders:
                 gpu_available = True
                 gpu_codec = "h264_qsv"
+                hw_device = "-init_hw_device qsv=qsv:hw -filter_hw_device qsv"
                 print("  Intel QuickSync acceleration available")
-            elif "vaapi" in hw_accels:
+            # VAAPI (Linux)
+            elif "vaapi" in hw_accels and "h264_vaapi" in encoders:
                 gpu_available = True
                 gpu_codec = "h264_vaapi"
+                hw_device = "-vaapi_device /dev/dri/renderD128"
                 print("  VAAPI acceleration available")
-            elif "videotoolbox" in hw_accels:  # macOS
+            # VideoToolbox (macOS)
+            elif "videotoolbox" in hw_accels and "h264_videotoolbox" in encoders:
                 gpu_available = True
                 gpu_codec = "h264_videotoolbox"
                 print("  VideoToolbox acceleration available (macOS)")
@@ -278,20 +292,20 @@ def merge_videos_with_trim(video_files, output_file, input_dir, use_gpu=True, cp
             print(f"  Error checking GPU availability: {str(e)}")
             gpu_available = False
     
-    # Get input video codec information for the first file to match quality
-    probe_cmd = [
-        "ffprobe",
-        "-v", "error",
-        "-select_streams", "v:0",
-        "-show_entries", "stream=codec_name,bit_rate,width,height",
-        "-of", "json",
-        trim_info[0]["file_path"]
-    ]
-    
+    # Get input video codec information for quality matching
     try:
+        probe_cmd = [
+            "ffprobe",
+            "-v", "error",
+            "-select_streams", "v:0",
+            "-show_entries", "stream=codec_name,bit_rate,width,height",
+            "-of", "json",
+            trim_info[0]["file_path"]
+        ]
+        
         probe_result = subprocess.run(probe_cmd, capture_output=True, text=True)
         codec_info = json.loads(probe_result.stdout)
-        video_codec = codec_info['streams'][0].get('codec_name', 'h264_nvenc')
+        video_codec = codec_info['streams'][0].get('codec_name', 'h264')
         
         # Try to get bitrate, default to high quality if not available
         try:
@@ -302,7 +316,7 @@ def merge_videos_with_trim(video_files, output_file, input_dir, use_gpu=True, cp
         print(f"  Source video codec: {video_codec}, bitrate: {bitrate/1000000:.2f} Mbps")
     except Exception as e:
         print(f"  Error getting codec info: {str(e)}")
-        video_codec = 'h264_nvenc'
+        video_codec = 'h264'
         bitrate = 8000000
     
     # Calculate total duration for progress reporting
@@ -311,159 +325,267 @@ def merge_videos_with_trim(video_files, output_file, input_dir, use_gpu=True, cp
         total_duration += info['duration']
     print(f"  Total video duration: {total_duration:.2f} seconds")
     
-    # Build the trim and concat filter complex
-    for i, info in enumerate(trim_info):
-        # Add trim filter
-        filter_complex += f"[{i}:v]trim=start={info['start_time']}:duration={info['duration']},setpts=PTS-STARTPTS[v{i}];"
-        filter_complex += f"[{i}:a]atrim=start={info['start_time']}:duration={info['duration']},asetpts=PTS-STARTPTS[a{i}];"
-        
-        # Add to concat list
-        concat_parts.append(f"[v{i}][a{i}]")
+    # Create temporary directory for intermediate files
+    # Use os.path.dirname to ensure we're getting just the directory
+    output_dir = os.path.dirname(os.path.abspath(output_file))
+    # Use basename to get just the filename without the path
+    output_basename = os.path.basename(output_file)
+    # Create a unique temp dir name
+    temp_dir = os.path.join(output_dir, f"temp_{int(datetime.datetime.now().timestamp())}")
     
-    # Add concat filter with safe option for different bitrates
-    filter_complex += f"{''.join(concat_parts)}concat=n={len(trim_info)}:v=1:a=1[outv][outa]"
+    # Create the temp directory if it doesn't exist
+    if not os.path.exists(temp_dir):
+        os.makedirs(temp_dir)
     
-    # Build ffmpeg command
-    cmd = ["ffmpeg", "-hide_banner", "-y"]
-    
-    # Add inputs
-    for info in trim_info:
-        cmd.extend(["-i", info["file_path"]])
-    
-    # Add filter complex
-    cmd.extend(["-filter_complex", filter_complex])
-    
-    # Add mapping
-    cmd.extend(["-map", "[outv]", "-map", "[outa]"])
-    
-    # Add progress monitoring
-    cmd.extend(["-progress", "pipe:1", "-stats"])
-    
-    # Set thread count if specified
-    if cpu_threads > 0:
-        cmd.extend(["-threads", str(cpu_threads)])
-    
-    # Add codec options based on GPU availability
-    if gpu_available and gpu_codec:
-        if "nvenc" in gpu_codec:
-            # NVIDIA GPU settings with high quality preset
-            cmd.extend([
-                "-pix_fmt", "yuv420p",
-                "-c:v", gpu_codec,
-                "-preset", "p7",     # p7 is equivalent to "slow" - high quality
-                "-tune", "hq",       # High quality tuning
-                "-rc:v", "vbr",      # Variable bitrate mode
-                "-cq:v", "18",       # Lower value means better quality
-                "-c:a", "aac",
-                "-b:v", str(bitrate), 
-                "-maxrate:v", str(int(bitrate * 1.5)),
-                "-bufsize:v", str(int(bitrate * 2))
-            ])
-        elif "qsv" in gpu_codec:
-            # Intel QuickSync settings
-            cmd.extend([
-                "-c:v", gpu_codec,
-                "-preset", "veryslow",
-                "-global_quality", "19",  # Lower is better quality
-                "-b:v", str(bitrate)
-            ])
-        elif "vaapi" in gpu_codec:
-            # VAAPI (Intel/AMD) settings
-            cmd.extend([
-                "-c:v", gpu_codec,
-                "-qp", "19",
-                "-b:v", str(bitrate)
-            ])
-        elif "videotoolbox" in gpu_codec:
-            # macOS VideoToolbox
-            cmd.extend([
-                "-c:v", gpu_codec,
-                "-b:v", str(bitrate),
-                "-allow_sw", "1"     # Allow software fallback
-            ])
-    else:
-        # CPU encoding with quality focus - try to match source codec if possible
-        if video_codec in ['h264', 'libx264']:
-            cmd.extend([
-                "-c:v", "libx264",
-                "-preset", "medium",  # Balance between speed and quality
-                "-crf", "18",         # Lower crf means better quality (18-23 is visually lossless)
-                "-b:v", str(bitrate)
-            ])
-        else:
-            # Default to high quality H.264
-            cmd.extend([
-                "-c:v", "libx264",
-                "-preset", "medium",
-                "-crf", "18",
-                "-b:v", str(bitrate)
-            ])
-    
-    # Audio codec with high quality
-    cmd.extend([
-        "-c:a", "aac",
-        "-b:a", "192k",
-        "-y",  # Overwrite output
-        output_file
-    ])
-    
-    # Print command for debugging
-    cmd_str = " ".join(cmd)
-    print(f"  FFmpeg command: {cmd_str[:100]}...")
-    
-    # Execute command with progress tracking
     try:
-        process = subprocess.Popen(
-            cmd, 
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            universal_newlines=True,
-            bufsize=1
-        )
+        # First, create trimmed segments of each video
+        print("  Trimming individual segments...")
+        trimmed_segments = []
         
-        # Variables to track progress
-        progress = 0
-        
-        print("  Processing: [" + " " * 50 + "] 0%", end="\r", flush=True)
-        
-        # Monitor process output for progress updates
-        for line in process.stdout:
-            line = line.strip()
+        for i, info in enumerate(trim_info):
+            # Create a temporary file for each trimmed segment with absolute path
+            temp_file = os.path.join(temp_dir, f"segment_{i}.mp4")
+            trimmed_segments.append(temp_file)
             
-            # Look for progress information
-            if line.startswith("out_time_ms="):
-                try:
-                    # Convert microseconds to seconds
-                    time_ms = int(line.split("=")[1])
-                    current_time = time_ms / 1000000
+            # Build ffmpeg command for trimming
+            trim_cmd = ["ffmpeg", "-hide_banner", "-y", "-i", info["file_path"]]
+            
+            # Add hardware acceleration if available
+            if gpu_available and hw_device:
+                trim_cmd.extend(hw_device.split())
+            
+            # Add trim options
+            trim_cmd.extend([
+                "-ss", str(info["start_time"]), 
+                "-t", str(info["duration"]),
+                "-c:v"
+            ])
+            
+            # Add codec options based on GPU availability
+            if gpu_available and gpu_codec:
+                if "nvenc" in gpu_codec:
+                    trim_cmd.extend([
+                        gpu_codec,
+                        "-preset", "p7",     # p7 is equivalent to "slow" - high quality
+                        "-rc:v", "vbr",      # Variable bitrate mode
+                        "-cq:v", "18",       # Lower value means better quality
+                        "-b:v", str(bitrate)
+                    ])
+                elif "qsv" in gpu_codec:
+                    trim_cmd.extend([
+                        gpu_codec,
+                        "-preset", "veryslow",
+                        "-global_quality", "19",
+                        "-b:v", str(bitrate)
+                    ])
+                elif "vaapi" in gpu_codec:
+                    trim_cmd.extend([
+                        gpu_codec,
+                        "-qp", "19",
+                        "-b:v", str(bitrate)
+                    ])
+                elif "videotoolbox" in gpu_codec:
+                    trim_cmd.extend([
+                        gpu_codec,
+                        "-b:v", str(bitrate),
+                        "-allow_sw", "1"
+                    ])
+            else:
+                # CPU encoding
+                trim_cmd.extend([
+                    "libx264",
+                    "-preset", "medium",
+                    "-crf", "18",
+                    "-b:v", str(bitrate)
+                ])
+            
+            # Add audio options and output file
+            trim_cmd.extend([
+                "-c:a", "aac",
+                "-b:a", "192k",
+                temp_file
+            ])
+            
+            # Run the trim command
+            print(f"  Trimming segment {i+1}/{len(trim_info)}: {info['duration']:.2f} seconds")
+            result = subprocess.run(trim_cmd, capture_output=True, text=True)
+            
+            if result.returncode != 0:
+                print(f"  Error trimming segment {i+1}: {result.stderr}")
+                raise Exception(f"FFmpeg error: {result.stderr}")
+        
+        # Second phase: hierarchical concatenation in batches of 10
+        print("  Starting hierarchical concatenation in batches...")
+        
+        # Function to concatenate a batch of files
+        def concatenate_batch(input_files, output_file, batch_num, level=1):
+            print(f"  Concatenating batch {batch_num} (level {level}) with {len(input_files)} clips...")
+            
+            # Create a concat file with absolute paths
+            concat_file = os.path.join(temp_dir, f"concat_batch_{level}_{batch_num}.txt")
+            with open(concat_file, 'w') as f:
+                for file_path in input_files:
+                    # Make sure to use the absolute path and escape backslashes for Windows
+                    escaped_path = file_path.replace('\\', '\\\\')
+                    f.write(f"file '{escaped_path}'\n")
+                # Add final newline to ensure EOF newline
+                f.write("\n")
+            
+            # Build the concat command
+            concat_cmd = [
+                "ffmpeg", 
+                "-hide_banner", 
+                "-y", 
+                "-safe", "0", 
+                "-f", "concat", 
+                "-i", concat_file
+            ]
+            
+            # Add progress monitoring
+            concat_cmd.extend(["-progress", "pipe:1", "-stats"])
+            
+            # Set thread count if specified
+            if cpu_threads > 0:
+                concat_cmd.extend(["-threads", str(cpu_threads)])
+            
+            # Add hardware acceleration if available
+            if gpu_available and hw_device:
+                concat_cmd.extend(hw_device.split())
+            
+            # Configure video and audio codec options
+            if gpu_available and gpu_codec:
+                concat_cmd.extend(["-c:v", gpu_codec])
+                
+                if "nvenc" in gpu_codec:
+                    concat_cmd.extend([
+                        "-preset", "p4",      # p4 is medium quality/speed balance
+                        "-rc:v", "vbr",       # Variable bitrate mode
+                        "-cq:v", "19",        # Quality level (18-20 is good for batch processing)
+                        "-b:v", str(bitrate)
+                    ])
+                elif "qsv" in gpu_codec:
+                    concat_cmd.extend([
+                        "-preset", "medium",
+                        "-global_quality", "20",
+                        "-b:v", str(bitrate)
+                    ])
+                elif "vaapi" in gpu_codec:
+                    concat_cmd.extend([
+                        "-qp", "21",
+                        "-b:v", str(bitrate)
+                    ])
+                elif "videotoolbox" in gpu_codec:
+                    concat_cmd.extend([
+                        "-b:v", str(bitrate),
+                        "-allow_sw", "1"
+                    ])
+            else:
+                # CPU encoding with moderate settings for batch processing
+                concat_cmd.extend([
+                    "-c:v", "libx264",
+                    "-preset", "medium",
+                    "-crf", "20",
+                ])
+            
+            # Add audio codec and output file
+            concat_cmd.extend([
+                "-c:a", "copy",
+                output_file
+            ])
+            
+            # Print command for debugging
+            cmd_str = " ".join(concat_cmd)
+            print(f"  FFmpeg batch {batch_num} command: {cmd_str[:100]}...")
+            
+            # Execute command
+            result = subprocess.run(concat_cmd, capture_output=True, text=True)
+            
+            if result.returncode != 0:
+                print(f"  Error concatenating batch {batch_num}: {result.stderr}")
+                # If GPU encoding failed, retry with CPU
+                if gpu_available and "Error while opening encoder" in result.stderr:
+                    print(f"  GPU encoding failed, falling back to CPU for this batch...")
+                    # Build a new command without GPU acceleration
+                    cpu_concat_cmd = [
+                        "ffmpeg", "-hide_banner", "-y", "-safe", "0", 
+                        "-f", "concat", "-i", concat_file
+                    ]
                     
-                    # Calculate progress percentage
-                    if total_duration > 0:
-                        new_progress = min(int((current_time / total_duration) * 100), 100)
-                        
-                        # Only update if progress has changed
-                        if new_progress != progress:
-                            progress = new_progress
-                            bar_length = int(progress / 2)
-                            progress_bar = "[" + "#" * bar_length + " " * (50 - bar_length) + "]"
-                            print(f"  Processing: {progress_bar} {progress}%", end="\r", flush=True)
-                except (ValueError, ZeroDivisionError):
-                    pass
+                    if cpu_threads > 0:
+                        cpu_concat_cmd.extend(["-threads", str(cpu_threads)])
+                    
+                    cpu_concat_cmd.extend([
+                        "-c:v", "libx264", "-preset", "medium", "-crf", "20",
+                        "-c:a", "copy", output_file
+                    ])
+                    
+                    print(f"  Retrying batch {batch_num} with CPU: {' '.join(cpu_concat_cmd)[:100]}...")
+                    retry_result = subprocess.run(cpu_concat_cmd, capture_output=True, text=True)
+                    
+                    if retry_result.returncode != 0:
+                        print(f"  CPU fallback also failed: {retry_result.stderr}")
+                        raise Exception(f"FFmpeg batch error: Both GPU and CPU encoding failed")
+                    return output_file
+                else:
+                    raise Exception(f"FFmpeg batch error: {result.stderr}")
+            
+            return output_file
         
-        # Wait for process to complete
-        process.wait()
+        # Process the segments hierarchically
+        current_level_files = trimmed_segments.copy()
+        level = 1
         
-        # Ensure we show 100% at the end
-        print("  Processing: [" + "#" * 50 + "] 100%")
+        while len(current_level_files) > 1:
+            print(f"  Level {level} concatenation: processing {len(current_level_files)} files")
+            next_level_files = []
+            
+            # Process in batches of 10
+            for i in range(0, len(current_level_files), 10):
+                batch = current_level_files[i:i+10]
+                if len(batch) == 1 and len(current_level_files) > 10:
+                    # If only one file in batch and not the final level, just pass it through
+                    next_level_files.append(batch[0])
+                    continue
+                
+                # Concatenate this batch
+                batch_output = os.path.join(temp_dir, f"level_{level}_batch_{i//10}.mp4")
+                concatenated_file = concatenate_batch(batch, batch_output, i//10, level)
+                next_level_files.append(concatenated_file)
+            
+            # Update for next level
+            current_level_files = next_level_files
+            level += 1
         
-        if process.returncode != 0:
-            stderr_output = process.stderr.read()
-            print(f"  Error merging videos: {stderr_output}")
+        # Final step - move/rename the last file to the output
+        if len(current_level_files) == 1:
+            # Either copy or rename based on whether they're on same filesystem
+            try:
+                os.replace(current_level_files[0], output_file)
+            except OSError:
+                # If replace fails (e.g., different filesystems), copy and delete
+                shutil.copy2(current_level_files[0], output_file)
+                os.remove(current_level_files[0])
+            
+            print(f"  Successfully merged {len(trimmed_segments)} segments into {output_file}")
+            return True
+        else:
+            print(f"  Error: No files remaining after hierarchical merge")
             return False
-        return True
+            
     except Exception as e:
-        print(f"  Error executing ffmpeg: {str(e)}")
+        print(f"  Error processing videos: {str(e)}")
         return False
+    
+    finally:
+        # Clean up temporary files and directory
+        try:
+            if 'temp_dir' in locals() and os.path.exists(temp_dir):
+                for file in os.listdir(temp_dir):
+                    os.remove(os.path.join(temp_dir, file))
+                os.rmdir(temp_dir)
+        except Exception as e:
+            print(f"  Warning: Error cleaning up temporary files: {str(e)}")
+            # Continue even if cleanup fails
 
 def process_dashcam_videos(input_dir, output_dir, max_gap=30.0, use_gpu=True, cpu_threads=0, camera_type=None, summary_only=False):
     """
