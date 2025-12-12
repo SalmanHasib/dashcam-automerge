@@ -14,6 +14,7 @@ A tool for consolidating dashcam footage into continuous video segments, and aut
 - Quality preservation to match source video
 - Real-time progress tracking during video processing
 - Summary mode to analyze footage without processing
+__Note:__ At the moment, this script is tailored for BlackVue dashcams (based on their filename structure). You can change that within the script if you run into issues. If you have a different dashcam with a different filename structure, please open an issue and I can add that as an option.
 
 ## Requirements
 
