@@ -202,3 +202,7 @@ Dashcam footage often contains overlapping segments. This tool handles these ove
 4. Joining the trimmed videos to create a single continuous video without repetition
 
 This ensures the final video shows each moment only once, creating a seamless viewing experience. 
+
+## Known Issues
+- Audio artifacts at some merge points
+- Missing footage for some clips with overlapping time -> this is inconsistent, still trying to figure out what causes it.
