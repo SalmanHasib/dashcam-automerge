@@ -10,6 +10,10 @@ import sys
 from collections import defaultdict
 import shutil
 
+# Add these imports for report generation
+import time
+import html
+
 def parse_filename(filename):
     """
     Parse dashcam filename to extract timestamp and camera type.
@@ -220,7 +224,7 @@ def generate_trim_info(video_files, input_dir):
     
     return trim_info
 
-def merge_videos_with_trim(video_files, output_file, input_dir, use_gpu=True, cpu_threads=0):
+def merge_videos_with_trim(video_files, output_file, input_dir, temp_dir=None, use_gpu=True, cpu_threads=0):
     """
     Merge video files using ffmpeg, trimming overlapping parts.
     Leverages GPU acceleration if available and preserves input quality.
@@ -231,6 +235,7 @@ def merge_videos_with_trim(video_files, output_file, input_dir, use_gpu=True, cp
         video_files: List of video file paths to merge
         output_file: Path to the output file
         input_dir: Directory containing the input files
+        temp_dir: Directory to store temporary files (if None, uses output directory)
         use_gpu: Whether to attempt to use GPU acceleration
         cpu_threads: Number of CPU threads to use (0=auto)
     """
@@ -327,11 +332,13 @@ def merge_videos_with_trim(video_files, output_file, input_dir, use_gpu=True, cp
     
     # Create temporary directory for intermediate files
     # Use os.path.dirname to ensure we're getting just the directory
-    output_dir = os.path.dirname(os.path.abspath(output_file))
-    # Use basename to get just the filename without the path
-    output_basename = os.path.basename(output_file)
-    # Create a unique temp dir name
-    temp_dir = os.path.join(output_dir, f"temp_{int(datetime.datetime.now().timestamp())}")
+    if temp_dir is None:
+        output_dir = os.path.dirname(os.path.abspath(output_file))
+        # Create a unique temp dir name in the output directory
+        temp_dir = os.path.join(output_dir, f"temp_{int(datetime.datetime.now().timestamp())}")
+    else:
+        # Use the provided temp_dir, but still create a unique subfolder
+        temp_dir = os.path.join(temp_dir, f"temp_{os.path.basename(output_file)}_{int(datetime.datetime.now().timestamp())}")
     
     # Create the temp directory if it doesn't exist
     if not os.path.exists(temp_dir):
@@ -587,7 +594,7 @@ def merge_videos_with_trim(video_files, output_file, input_dir, use_gpu=True, cp
             print(f"  Warning: Error cleaning up temporary files: {str(e)}")
             # Continue even if cleanup fails
 
-def process_dashcam_videos(input_dir, output_dir, max_gap=30.0, use_gpu=True, cpu_threads=0, camera_type=None, summary_only=False):
+def process_dashcam_videos(input_dir, output_dir, max_gap=30.0, use_gpu=True, cpu_threads=0, camera_type=None, summary_only=False, temp_dir=None):
     """
     Process dashcam videos from the input directory.
     
@@ -599,17 +606,47 @@ def process_dashcam_videos(input_dir, output_dir, max_gap=30.0, use_gpu=True, cp
         cpu_threads: Number of CPU threads to use (0=auto)
         camera_type: Optional filter to only process specific camera type (front, rear)
         summary_only: If True, only show summary information without processing files
+        temp_dir: Optional directory to store temporary files during processing
+    
+    Returns:
+        report_data: Dictionary containing processing results for reporting
     """
+    # Initialize report data
+    report_data = {
+        'start_time': datetime.datetime.now(),
+        'input_dir': input_dir,
+        'output_dir': output_dir,
+        'max_gap': max_gap,
+        'use_gpu': use_gpu,
+        'cpu_threads': cpu_threads,
+        'camera_type': camera_type,
+        'temp_dir': temp_dir,
+        'camera_summary': {},
+        'processing_results': []
+    }
+    
     if not summary_only and not os.path.exists(output_dir):
         os.makedirs(output_dir)
+    
+    # Create temp directory if specified and doesn't exist
+    if temp_dir and not os.path.exists(temp_dir):
+        try:
+            os.makedirs(temp_dir)
+            print(f"Created temporary directory: {temp_dir}")
+        except Exception as e:
+            print(f"Error creating temporary directory {temp_dir}: {str(e)}")
+            print("Using default temporary directory instead")
+            temp_dir = None
     
     # Get all MP4 files
     all_files = [f for f in os.listdir(input_dir) if f.lower().endswith('.mp4')]
     if not all_files:
         print(f"No MP4 files found in {input_dir}")
-        return
+        report_data['error'] = "No MP4 files found"
+        return report_data
     
     print(f"Found {len(all_files)} MP4 files")
+    report_data['total_files'] = len(all_files)
     
     # Parse filenames and organize by camera type
     videos_by_camera = defaultdict(list)
@@ -628,23 +665,124 @@ def process_dashcam_videos(input_dir, output_dir, max_gap=30.0, use_gpu=True, cp
     
     if not videos_by_camera:
         print("No valid dashcam videos found. Please check if the files follow the supported naming formats.")
-        return
+        report_data['error'] = "No valid dashcam videos found"
+        return report_data
     
     # Print summary of found videos
     print("\nFound videos by camera type:")
     for cam_type, videos in videos_by_camera.items():
         print(f"  {cam_type}: {len(videos)} videos")
+        report_data['camera_summary'][cam_type] = len(videos)
     
     # Filter by camera type if specified
     if camera_type:
         if camera_type not in videos_by_camera:
             print(f"No videos found for camera type: {camera_type}")
-            return
+            report_data['error'] = f"No videos found for camera type: {camera_type}"
+            return report_data
         process_cameras = [camera_type]
     else:
         process_cameras = list(videos_by_camera.keys())
     
-    # For each camera type, analyze continuity
+    # First phase: analyze and create the report data (without processing)
+    analyze_all_cameras(process_cameras, videos_by_camera, input_dir, max_gap, report_data)
+    
+    # If summary only, exit here
+    if summary_only:
+        print("\nSummary complete. No files were processed.")
+        report_data['summary_only'] = True
+        return report_data
+    
+    # Second phase: process one group at a time for each camera
+    for cam_type_index, cam_type in enumerate(process_cameras):
+        videos = videos_by_camera[cam_type]
+        print(f"\nProcessing {cam_type} camera videos...")
+        
+        # Group videos by continuity
+        video_groups = group_videos_by_continuity(videos, max_gap, input_dir)
+        
+        camera_data = report_data['processing_results'][cam_type_index]
+        camera_data['processed_segments'] = []
+        
+        for i, group in enumerate(video_groups):
+            print(f"\n=== Processing segment {i+1}/{len(video_groups)} for {cam_type} camera ===")
+            
+            # Sort videos in each group by timestamp
+            sorted_group = sorted(group, key=lambda x: x["timestamp"])
+            
+            # Get list of video files
+            video_files = [os.path.join(input_dir, video["filename"]) for video in sorted_group]
+            
+            # Define output filename
+            start_time = sorted_group[0]["timestamp"]
+            end_time = sorted_group[-1]["timestamp"]
+            
+            start_str = start_time.strftime("%Y%m%d_%H%M%S")
+            end_str = end_time.strftime("%Y%m%d_%H%M%S")
+            
+            output_file = os.path.join(
+                output_dir, 
+                f"{cam_type}_{start_str}_to_{end_str}.mp4"
+            )
+            
+            print(f"  Merging group {i+1}/{len(video_groups)} with {len(video_files)} videos")
+            print(f"  Output: {output_file}")
+            
+            segment_result = {
+                'index': i+1,
+                'output_file': output_file,
+                'num_videos': len(video_files),
+                'start_time': start_time,
+                'end_time': end_time,
+                'start_str': start_str,
+                'end_str': end_str,
+                'processing_start': datetime.datetime.now()
+            }
+            
+            # Merge videos with trimming - process this group before moving to the next
+            print("  Starting FFmpeg merge with overlap handling...")
+            success = merge_videos_with_trim(
+                video_files, 
+                output_file, 
+                input_dir, 
+                temp_dir=temp_dir,
+                use_gpu=use_gpu, 
+                cpu_threads=cpu_threads
+            )
+            
+            segment_result['success'] = success
+            segment_result['processing_end'] = datetime.datetime.now()
+            segment_result['processing_time'] = (segment_result['processing_end'] - segment_result['processing_start']).total_seconds()
+            
+            if success:
+                print(f"  Successfully merged videos to {output_file}")
+                # Get size of output file
+                try:
+                    segment_result['output_size'] = os.path.getsize(output_file)
+                    segment_result['output_size_mb'] = segment_result['output_size'] / (1024 * 1024)
+                except:
+                    segment_result['output_size'] = 0
+                    segment_result['output_size_mb'] = 0
+            else:
+                print(f"  Failed to merge videos to {output_file}")
+            
+            camera_data['processed_segments'].append(segment_result)
+    
+    report_data['end_time'] = datetime.datetime.now()
+    report_data['total_processing_time'] = (report_data['end_time'] - report_data['start_time']).total_seconds()
+    
+    if not summary_only:
+        print("\nDashcam video consolidation complete!")
+        # Generate report
+        generate_report(report_data, output_dir)
+    
+    return report_data
+
+def analyze_all_cameras(process_cameras, videos_by_camera, input_dir, max_gap, report_data):
+    """
+    Analyze all cameras and segments without processing them.
+    Updates the report_data in place.
+    """
     for cam_type in process_cameras:
         videos = videos_by_camera[cam_type]
         print(f"\nAnalyzing {cam_type} camera videos...")
@@ -653,6 +791,14 @@ def process_dashcam_videos(input_dir, output_dir, max_gap=30.0, use_gpu=True, cp
         print("  Analyzing time continuity...")
         video_groups = group_videos_by_continuity(videos, max_gap, input_dir)
         print(f"  Found {len(video_groups)} continuous segments")
+        
+        camera_data = {
+            'type': cam_type,
+            'total_videos': len(videos),
+            'total_segments': len(video_groups),
+            'total_duration': 0,
+            'segments': []
+        }
         
         # Print summary of each group
         total_duration = 0
@@ -704,6 +850,20 @@ def process_dashcam_videos(input_dir, output_dir, max_gap=30.0, use_gpu=True, cp
             duration_str = f"{int(group_duration // 60)}:{int(group_duration % 60):02d}"
             
             print(f"  Group {i+1}: {len(sorted_group)} videos, {start_str} to {end_str}, Duration: {duration_str}")
+            
+            # Save segment data for report
+            segment_data = {
+                'index': i+1,
+                'num_videos': len(sorted_group),
+                'start_time': start_time,
+                'end_time': end_time,
+                'duration': group_duration,
+                'duration_str': duration_str,
+                'videos': [v['filename'] for v in sorted_group]
+            }
+            camera_data['segments'].append(segment_data)
+        
+        camera_data['total_duration'] = total_duration
         
         # Print total duration
         hours = int(total_duration // 3600)
@@ -715,53 +875,179 @@ def process_dashcam_videos(input_dir, output_dir, max_gap=30.0, use_gpu=True, cp
         else:
             duration_str = f"{minutes}m {seconds}s"
         
+        camera_data['duration_str'] = duration_str
         print(f"  Total {cam_type} camera footage: {duration_str}")
+        report_data['processing_results'].append(camera_data)
+
+def generate_report(report_data, output_dir):
+    """Generate an HTML report of the processing results"""
+    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    report_file = os.path.join(output_dir, f"processing_report_{timestamp}.html")
     
-    # If summary only, exit here
-    if summary_only:
-        print("\nSummary complete. No files were processed.")
-        return
+    # Basic styling
+    css = """
+    <style>
+        body { font-family: Arial, sans-serif; margin: 20px; line-height: 1.6; }
+        h1, h2, h3 { color: #333; }
+        .container { max-width: 1200px; margin: 0 auto; }
+        .summary-box { background-color: #f5f5f5; padding: 15px; border-radius: 5px; margin-bottom: 20px; }
+        .success { color: green; }
+        .failure { color: red; }
+        table { border-collapse: collapse; width: 100%; margin-bottom: 20px; }
+        th, td { border: 1px solid #ddd; padding: 8px; text-align: left; }
+        th { background-color: #f2f2f2; }
+        tr:nth-child(even) { background-color: #f9f9f9; }
+        .segment { margin-bottom: 30px; border-bottom: 1px solid #eee; padding-bottom: 10px; }
+        .segment-header { background-color: #e9e9e9; padding: 10px; margin-bottom: 10px; border-radius: 5px; }
+        .segment-details { margin-left: 20px; }
+        .video-list { max-height: 200px; overflow-y: auto; border: 1px solid #ddd; padding: 10px; }
+    </style>
+    """
     
-    # Process each camera type
-    for cam_type in process_cameras:
-        videos = videos_by_camera[cam_type]
-        print(f"\nProcessing {cam_type} camera videos...")
+    # Begin HTML document
+    html_content = f"""<!DOCTYPE html>
+    <html>
+    <head>
+        <meta charset="UTF-8">
+        <title>Dashcam Video Processing Report - {timestamp}</title>
+        {css}
+    </head>
+    <body>
+        <div class="container">
+            <h1>Dashcam Video Processing Report</h1>
+            <div class="summary-box">
+                <h2>Processing Summary</h2>
+                <p><strong>Start Time:</strong> {report_data['start_time'].strftime("%Y-%m-%d %H:%M:%S")}</p>
+                <p><strong>End Time:</strong> {report_data['end_time'].strftime("%Y-%m-%d %H:%M:%S")}</p>
+                <p><strong>Total Processing Time:</strong> {format_time(report_data['total_processing_time'])}</p>
+                <p><strong>Input Directory:</strong> {html.escape(report_data['input_dir'])}</p>
+                <p><strong>Output Directory:</strong> {html.escape(report_data['output_dir'])}</p>
+                <p><strong>Total Files Found:</strong> {report_data['total_files']}</p>
+                <p><strong>GPU Acceleration:</strong> {'Enabled' if report_data['use_gpu'] else 'Disabled'}</p>
+                <p><strong>Max Gap Between Clips:</strong> {report_data['max_gap']} seconds</p>
+                <p><strong>Camera Type Filter:</strong> {report_data['camera_type'] if report_data['camera_type'] else 'None (all cameras)'}</p>
+            </div>
+            
+            <h2>Camera Summary</h2>
+            <table>
+                <tr><th>Camera Type</th><th>Number of Videos</th></tr>
+    """
+    
+    # Add camera summary
+    for cam_type, count in report_data['camera_summary'].items():
+        html_content += f"<tr><td>{cam_type}</td><td>{count}</td></tr>\n"
+    
+    html_content += """
+            </table>
+            
+            <h2>Processing Results</h2>
+    """
+    
+    # Add results for each camera type
+    for camera_data in report_data['processing_results']:
+        cam_type = camera_data['type']
+        html_content += f"""
+            <h3>Camera: {cam_type}</h3>
+            <p><strong>Total Videos:</strong> {camera_data['total_videos']}</p>
+            <p><strong>Total Segments:</strong> {camera_data['total_segments']}</p>
+            <p><strong>Total Duration:</strong> {camera_data['duration_str']}</p>
+        """
         
-        # Group videos by continuity
-        video_groups = group_videos_by_continuity(videos, max_gap, input_dir)
-        
-        for i, group in enumerate(video_groups):
-            # Sort videos in each group by timestamp
-            sorted_group = sorted(group, key=lambda x: x["timestamp"])
+        # Add segment information
+        if 'processed_segments' in camera_data:
+            # Processing results
+            successful_segments = sum(1 for seg in camera_data['processed_segments'] if seg['success'])
+            failed_segments = len(camera_data['processed_segments']) - successful_segments
             
-            # Get list of video files
-            video_files = [os.path.join(input_dir, video["filename"]) for video in sorted_group]
+            html_content += f"""
+                <h4>Processing Statistics</h4>
+                <p><strong>Successfully Merged Segments:</strong> <span class="success">{successful_segments}</span></p>
+                <p><strong>Failed Segments:</strong> <span class="failure">{failed_segments}</span></p>
+                
+                <h4>Detailed Segment Results</h4>
+            """
             
-            # Define output filename
-            start_time = sorted_group[0]["timestamp"]
-            end_time = sorted_group[-1]["timestamp"]
+            # List all processed segments
+            for segment in camera_data['processed_segments']:
+                status_class = "success" if segment['success'] else "failure"
+                status_text = "Success" if segment['success'] else "Failed"
+                
+                html_content += f"""
+                    <div class="segment">
+                        <div class="segment-header">
+                            <strong>Segment {segment['index']}:</strong> {segment['start_time'].strftime("%Y-%m-%d %H:%M:%S")} to {segment['end_time'].strftime("%Y-%m-%d %H:%M:%S")} - 
+                            <span class="{status_class}">{status_text}</span>
+                        </div>
+                        <div class="segment-details">
+                            <p><strong>Output File:</strong> {os.path.basename(segment['output_file'])}</p>
+                            <p><strong>Number of Videos:</strong> {segment['num_videos']}</p>
+                            <p><strong>Processing Time:</strong> {format_time(segment['processing_time'])}</p>
+                """
+                
+                if segment['success']:
+                    html_content += f"""
+                            <p><strong>Output Size:</strong> {segment['output_size_mb']:.2f} MB</p>
+                    """
+                
+                html_content += """
+                        </div>
+                    </div>
+                """
+        else:
+            # Just segment summary
+            html_content += """
+                <h4>Segment Summary</h4>
+                <table>
+                    <tr>
+                        <th>Segment</th>
+                        <th>Start Time</th>
+                        <th>End Time</th>
+                        <th>Duration</th>
+                        <th>Videos</th>
+                    </tr>
+            """
             
-            start_str = start_time.strftime("%Y%m%d_%H%M%S")
-            end_str = end_time.strftime("%Y%m%d_%H%M%S")
+            for segment in camera_data['segments']:
+                html_content += f"""
+                    <tr>
+                        <td>{segment['index']}</td>
+                        <td>{segment['start_time'].strftime("%Y-%m-%d %H:%M:%S")}</td>
+                        <td>{segment['end_time'].strftime("%Y-%m-%d %H:%M:%S")}</td>
+                        <td>{segment['duration_str']}</td>
+                        <td>{segment['num_videos']}</td>
+                    </tr>
+                """
             
-            output_file = os.path.join(
-                output_dir, 
-                f"{cam_type}_{start_str}_to_{end_str}.mp4"
-            )
-            
-            print(f"  Merging group {i+1}/{len(video_groups)} with {len(video_files)} videos")
-            print(f"  Output: {output_file}")
-            
-            # Merge videos with trimming
-            print("  Starting FFmpeg merge with overlap handling...")
-            success = merge_videos_with_trim(video_files, output_file, input_dir, use_gpu=use_gpu, cpu_threads=cpu_threads)
-            if success:
-                print(f"  Successfully merged videos to {output_file}")
-            else:
-                print(f"  Failed to merge videos to {output_file}")
+            html_content += """
+                </table>
+            """
     
-    if not summary_only:
-        print("\nDashcam video consolidation complete!")
+    # Close HTML document
+    html_content += """
+        </div>
+    </body>
+    </html>
+    """
+    
+    # Write the report file
+    with open(report_file, 'w', encoding='utf-8') as f:
+        f.write(html_content)
+    
+    print(f"\nProcessing report generated: {report_file}")
+    return report_file
+
+def format_time(seconds):
+    """Format seconds into a human-readable time string"""
+    hours = int(seconds // 3600)
+    minutes = int((seconds % 3600) // 60)
+    secs = int(seconds % 60)
+    
+    if hours > 0:
+        return f"{hours}h {minutes}m {secs}s"
+    elif minutes > 0:
+        return f"{minutes}m {secs}s"
+    else:
+        return f"{secs}s"
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Dashcam Video Consolidation Tool")
@@ -777,12 +1063,16 @@ if __name__ == "__main__":
                        help="Process only specified camera type (front or rear)")
     parser.add_argument("--summary-only", action="store_true",
                        help="Only show a summary of videos, don't process them")
+    parser.add_argument("--report-only", action="store_true",
+                       help="Generate a report from previously processed videos without processing new ones")
+    parser.add_argument("--temp-dir",
+                       help="Directory to store temporary files during processing")
     
     args = parser.parse_args()
     
     # Check if output_dir is required
-    if not args.summary_only and not args.output_dir:
-        parser.error("output_dir is required unless --summary-only is specified")
+    if not args.summary_only and not args.output_dir and not args.report_only:
+        parser.error("output_dir is required unless --summary-only or --report-only is specified")
     
     # Use input_dir as output_dir for summary-only mode if not specified
     output_dir = args.output_dir if args.output_dir else args.input_dir
@@ -795,5 +1085,6 @@ if __name__ == "__main__":
         not args.no_gpu,
         args.cpu_threads,
         args.camera,
-        args.summary_only
+        args.summary_only,
+        args.temp_dir
     )

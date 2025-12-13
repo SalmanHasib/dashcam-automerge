@@ -12,6 +12,9 @@ output/
 # FFmpeg temporary files
 temp_concat_*.txt
 
+# Log files
+*.log
+
 # Distribution / packaging
 dist/
 build/
